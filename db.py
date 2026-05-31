@@ -170,6 +170,26 @@ def delete_food_entry(entry_id: int, user_id: int) -> dict[str, Any] | None:
     return row
 
 
+def clear_today_food_log(user_id: int, entry_date: datetime.date) -> int:
+    """Delete all food_log entries for today and reset daily totals. Returns count deleted."""
+    with create_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM food_log WHERE user_id = %s AND date = %s",
+                (user_id, entry_date),
+            )
+            count = cur.rowcount
+            cur.execute(
+                """
+                UPDATE daily_nutrition
+                SET total_calories = 0, total_protein = 0
+                WHERE user_id = %s AND date = %s
+                """,
+                (user_id, entry_date),
+            )
+    return count
+
+
 def undo_last_food_entry(user_id: int, entry_date: datetime.date) -> dict[str, Any] | None:
     """Delete the most recent food_log entry for today and update totals."""
     with create_db_connection() as conn:

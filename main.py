@@ -16,6 +16,7 @@ from telebot.types import Update
 from handlers import (
     bot,
     handle_callback_query,
+    handle_clear,
     handle_photo,
     handle_text,
     handle_undo,
@@ -106,6 +107,8 @@ def _dispatch(message) -> None:
                 show_food_list(message)
             elif command == "/undo":
                 handle_undo(message)
+            elif command == "/clear":
+                handle_clear(message)
             elif command == "/ping":
                 ping(message)
             elif text.startswith("/"):

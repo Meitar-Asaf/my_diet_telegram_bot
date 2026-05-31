@@ -17,6 +17,7 @@ from telebot.types import (
 
 from db import (
     add_food_entry,
+    clear_today_food_log,
     delete_food_entry,
     get_daily_nutrition,
     get_today_food_log,
@@ -111,6 +112,17 @@ def handle_undo(message: Message) -> None:
         calories=deleted["calories"],
         protein=deleted["protein"],
     ))
+
+
+def handle_clear(message: Message) -> None:
+    LOGGER.info("Handling /clear for user_id=%s", message.from_user.id)
+    lang = detect_message_language(message, message.text)
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton(message_text(lang, "btn_yes"), callback_data="clear_yes"),
+        InlineKeyboardButton(message_text(lang, "btn_no"), callback_data="clear_no"),
+    )
+    bot.reply_to(message, message_text(lang, "clear_confirm"), reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
@@ -273,5 +285,19 @@ def handle_callback_query(call: CallbackQuery) -> None:
         bot.edit_message_text(reply, chat_id=chat_id, message_id=message_id)
 
     elif data == "del_no":
+        bot.edit_message_text(message_text(lang, "del_cancelled"), chat_id=chat_id, message_id=message_id)
+
+    elif data == "clear_yes":
+        count = clear_today_food_log(user_id, current_local_date())
+        if count == 0:
+            bot.edit_message_text(message_text(lang, "clear_empty"), chat_id=chat_id, message_id=message_id)
+        else:
+            bot.edit_message_text(
+                message_text(lang, "cleared").format(count=count),
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+
+    elif data == "clear_no":
         bot.edit_message_text(message_text(lang, "del_cancelled"), chat_id=chat_id, message_id=message_id)
 

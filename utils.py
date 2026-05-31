@@ -74,6 +74,9 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "delete_confirm": "למחוק?",
         "deleted": "✓ נמחק",
         "del_cancelled": "ביטול",
+        "clear_confirm": "למחוק את כל הרישומים של היום?",
+        "cleared": "✓ נמחקו כל הרישומים של היום ({count} פריטים)",
+        "clear_empty": "אין רישומים למחיקה.",
     },
     "en": {
         "welcome": "Send a food description or a meal photo. I will estimate calories and protein, save today's totals, and track your goals.",
@@ -103,6 +106,9 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "delete_confirm": "Delete?",
         "deleted": "✓ Deleted",
         "del_cancelled": "Cancelled",
+        "clear_confirm": "Delete all entries for today?",
+        "cleared": "✓ Deleted all today's entries ({count} items)",
+        "clear_empty": "No entries to delete.",
     },
 }
 
