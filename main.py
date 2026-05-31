@@ -12,6 +12,8 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, request
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import requests
 import telebot
 from telebot.types import Message, Update
@@ -25,8 +27,7 @@ LOGGER = logging.getLogger("nutrition_bot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "UTC")
 BOT_MODE = os.getenv("BOT_MODE", "webhook" if os.getenv("RENDER") else "polling")
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
@@ -35,8 +36,7 @@ PORT = int(os.getenv("PORT", "10000"))
 REQUIRED_ENV_VARS = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "GEMINI_API_KEY": GEMINI_API_KEY,
-    "SUPABASE_URL": SUPABASE_URL,
-    "SUPABASE_KEY": SUPABASE_KEY,
+    "DATABASE_URL": DATABASE_URL,
 }
 
 missing_env_vars = [name for name, value in REQUIRED_ENV_VARS.items() if not value]
@@ -64,12 +64,6 @@ GEMINI_SYSTEM_PROMPT = (
     "Always use integers. Never include explanations, markdown, or extra keys. If the "
     "meal is unclear, make the best reasonable estimate from the available information."
 )
-
-SUPABASE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-}
 
 WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
 webhook_lock = threading.Lock()
@@ -160,45 +154,20 @@ def call_gemini_for_food(
     return {"calories": calories, "protein": protein}
 
 
-def supabase_request(
-    method: str,
-    path: str,
-    *,
-    params: dict[str, Any] | None = None,
-    json_body: Any | None = None,
-    extra_headers: dict[str, str] | None = None,
-) -> Any:
-    headers = dict(SUPABASE_HEADERS)
-    if extra_headers:
-        headers.update(extra_headers)
-
-    response = requests.request(
-        method,
-        f"{SUPABASE_URL}/rest/v1/{path}",
-        headers=headers,
-        params=params,
-        json=json_body,
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    if not response.content:
-        return None
-    return response.json()
-
-
 def get_daily_nutrition(user_id: int, entry_date: datetime.date) -> dict[str, Any] | None:
-    rows = supabase_request(
-        "GET",
-        "daily_nutrition",
-        params={
-            "select": "user_id,date,total_calories,total_protein",
-            "user_id": f"eq.{user_id}",
-            "date": f"eq.{entry_date.isoformat()}",
-            "limit": 1,
-        },
-    )
-    return rows[0] if rows else None
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, date, total_calories, total_protein
+                FROM daily_nutrition
+                WHERE user_id = %s AND date = %s
+                LIMIT 1
+                """,
+                (user_id, entry_date),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def upsert_daily_nutrition(
@@ -207,23 +176,21 @@ def upsert_daily_nutrition(
     total_calories: int,
     total_protein: int,
 ) -> dict[str, Any]:
-    rows = supabase_request(
-        "POST",
-        "daily_nutrition",
-        params={"on_conflict": "user_id,date"},
-        json_body=[
-            {
-                "user_id": user_id,
-                "date": entry_date.isoformat(),
-                "total_calories": total_calories,
-                "total_protein": total_protein,
-            }
-        ],
-        extra_headers={
-            "Prefer": "resolution=merge-duplicates,return=representation"
-        },
-    )
-    return rows[0]
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO daily_nutrition (user_id, date, total_calories, total_protein)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, date)
+                DO UPDATE SET
+                    total_calories = EXCLUDED.total_calories,
+                    total_protein = EXCLUDED.total_protein
+                RETURNING user_id, date, total_calories, total_protein
+                """,
+                (user_id, entry_date, total_calories, total_protein),
+            )
+            return dict(cur.fetchone())
 
 
 def add_food_to_daily_totals(

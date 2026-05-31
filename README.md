@@ -1,26 +1,26 @@
 # My Diet Telegram Bot
 
-Telegram bot for daily nutrition tracking using pyTelegramBotAPI, Gemini Flash, and Supabase.
+Telegram bot for daily nutrition tracking using pyTelegramBotAPI, Gemini Flash, and PostgreSQL.
 
 ## Features
 
 - Analyze food text descriptions.
 - Analyze meal photos with Gemini Flash.
 - Return structured nutrition estimates in the bot flow.
-- Store daily totals in Supabase.
+- Store daily totals in PostgreSQL.
 - Support weekday calorie target logic and Saturday cheat day logic.
 - Deploy on Render with Telegram webhook mode.
 
 ## Files
 
-- `main.py` - bot logic, Gemini integration, Supabase integration, Render webhook app.
-- `schema.sql` - Supabase table creation script.
+- `main.py` - bot logic, Gemini integration, PostgreSQL integration, Render webhook app.
+- `schema.sql` - PostgreSQL table creation script.
 - `requirements.txt` - Python dependencies.
 - `render.yaml` - Render infrastructure configuration.
 
-## Supabase SQL
+## PostgreSQL SQL
 
-Run `schema.sql` in the Supabase SQL editor.
+Run `schema.sql` in your PostgreSQL database.
 
 ## Environment Variables
 
@@ -28,8 +28,7 @@ Set these in Render:
 
 - `TELEGRAM_BOT_TOKEN`
 - `GEMINI_API_KEY`
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
+- `DATABASE_URL`
 - `WEBHOOK_BASE_URL`
 - `APP_TIMEZONE`
 - `BOT_MODE=webhook`
