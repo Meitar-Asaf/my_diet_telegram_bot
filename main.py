@@ -99,6 +99,10 @@ class GeminiRateLimitError(Exception):
     """Raised when Gemini keeps returning 429 rate-limit responses."""
 
 
+class GeminiBadRequestError(Exception):
+    """Raised when Gemini rejects request payload with HTTP 400."""
+
+
 def current_local_date() -> datetime.date:
     """Return the current date in the configured application timezone."""
     return datetime.now(LOCAL_TIMEZONE).date()
@@ -203,6 +207,10 @@ def post_gemini_with_retry(payload: dict[str, Any], timeout: int = 60) -> dict[s
             time.sleep(delay)
             continue
 
+        if response.status_code == 400:
+            LOGGER.error("Gemini 400 response: %s", response.text)
+            raise GeminiBadRequestError(response.text)
+
         response.raise_for_status()
 
     raise GeminiRateLimitError("Gemini is rate-limited. Try again shortly.")
@@ -245,7 +253,36 @@ def call_gemini_for_food(
         },
     }
 
-    response_payload = post_gemini_with_retry(payload, timeout=60)
+    try:
+        response_payload = post_gemini_with_retry(payload, timeout=60)
+    except GeminiBadRequestError:
+        # Compatibility fallback for environments that reject responseMimeType/systemInstruction.
+        compatibility_parts = [
+            {
+                "text": (
+                    f"{GEMINI_SYSTEM_PROMPT}\n"
+                    "User entry (text may be empty if image-only): "
+                    f"{food_text or ''}\n"
+                    "Return JSON only."
+                )
+            }
+        ]
+        if image_bytes:
+            mime_type = image_mime_type or "image/jpeg"
+            compatibility_parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }
+                }
+            )
+
+        compatibility_payload = {
+            "contents": [{"role": "user", "parts": compatibility_parts}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        response_payload = post_gemini_with_retry(compatibility_payload, timeout=60)
     candidates = response_payload.get("candidates") or []
     if not candidates:
         raise ValueError(f"Gemini returned no candidates: {response_payload}")
@@ -531,6 +568,12 @@ def handle_text(message: Message) -> None:
             bot.reply_to(message, message_text(lang, "gemini_busy"))
             return
         LOGGER.exception("Failed to process text message")
+        bot.reply_to(
+            message,
+            message_text(lang, "text_error"),
+        )
+    except GeminiBadRequestError:
+        LOGGER.exception("Gemini rejected payload for text user_id=%s", message.from_user.id)
         bot.reply_to(
             message,
             message_text(lang, "text_error"),
