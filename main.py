@@ -88,64 +88,6 @@ webhook_lock = threading.Lock()
 webhook_initialized = False
 
 HEBREW_CHAR_PATTERN = re.compile(r"[\u0590-\u05FF]")
-FOOD_KEYWORDS_HE = {
-    "ארוחת",
-    "ארוחה",
-    "אכלתי",
-    "אוכל",
-    "לחם",
-    "ביצה",
-    "גבינה",
-    "אורז",
-    "עוף",
-    "פסטה",
-    "סלט",
-    "יוגורט",
-    "שייק",
-    "טונה",
-    "בשר",
-    "מרק",
-    "פרוסה",
-}
-FOOD_KEYWORDS_EN = {
-    "breakfast",
-    "lunch",
-    "dinner",
-    "meal",
-    "ate",
-    "food",
-    "bread",
-    "rice",
-    "chicken",
-    "egg",
-    "eggs",
-    "cheese",
-    "salad",
-    "pasta",
-    "protein",
-    "sandwich",
-    "yogurt",
-    "tuna",
-}
-SMALL_TALK_HE = {
-    "היי",
-    "הי",
-    "שלום",
-    "מה קורה",
-    "מה נשמע",
-    "בוקר טוב",
-    "ערב טוב",
-    "לילה טוב",
-}
-SMALL_TALK_EN = {
-    "hi",
-    "hey",
-    "hello",
-    "good morning",
-    "good evening",
-    "good night",
-    "how are you",
-}
 
 
 def current_local_date() -> datetime.date:
@@ -180,21 +122,52 @@ def detect_message_language(message: Message, text_hint: str | None = None) -> s
 
 
 def is_small_talk_or_non_food(text: str) -> bool:
-    """Return True when text looks like greeting/small-talk and not a food log."""
-    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    """Use Gemini to classify whether text should be handled as food logging input."""
+    normalized = re.sub(r"\s+", " ", text.strip())
     if not normalized:
         return True
 
-    if normalized in SMALL_TALK_HE or normalized in SMALL_TALK_EN:
-        return True
+    classifier_prompt = (
+        "Classify the user message intent for a nutrition logger bot. "
+        "Return JSON only in this exact format: {\"is_food\": true|false}. "
+        "Set is_food=true when the user likely describes food intake, meals, ingredients, "
+        "quantities, drinks, or asks to log nutrition. Set is_food=false for greetings, casual chat, "
+        "small talk, jokes, or unrelated questions.\n"
+        f"User message: {normalized}"
+    )
 
-    words = set(re.findall(r"[\w\u0590-\u05FF]+", normalized))
-    has_food_keyword = bool(words & FOOD_KEYWORDS_HE) or bool(words & FOOD_KEYWORDS_EN)
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": classifier_prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
 
-    # Very short free-text without food words is usually not a meal record.
-    if not has_food_keyword and len(words) <= 2:
-        return True
-    return False
+    try:
+        response = requests.post(
+            f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        response.raise_for_status()
+        response_payload = response.json()
+        candidates = response_payload.get("candidates") or []
+        if not candidates:
+            return False
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_fragments = [part.get("text", "") for part in parts if "text" in part]
+        if not text_fragments:
+            return False
+
+        parsed = extract_json_object("\n".join(text_fragments))
+        return not bool(parsed.get("is_food", False))
+    except Exception:
+        LOGGER.exception("Intent classification failed; defaulting to food analysis")
+        # On classifier failure, continue with nutrition analysis so logging still works.
+        return False
 
 
 def message_text(lang: str, key: str) -> str:
