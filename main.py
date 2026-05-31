@@ -379,6 +379,11 @@ def webhook_url() -> str:
     """Build the full Telegram webhook URL from the configured base URL."""
     if not WEBHOOK_BASE_URL:
         raise RuntimeError("WEBHOOK_BASE_URL is required when BOT_MODE=webhook.")
+
+    # Allow either a plain service URL or a URL that already contains the token path.
+    if WEBHOOK_BASE_URL.endswith(WEBHOOK_PATH):
+        return WEBHOOK_BASE_URL
+
     return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 
 
@@ -421,8 +426,18 @@ def telegram_webhook() -> tuple[str, int]:
     if not request.is_json:
         abort(403)
 
-    update = Update.de_json(request.get_data(as_text=True))
-    bot.process_new_updates([update])
+    payload = request.get_json(silent=True)
+    if not payload:
+        abort(400)
+
+    try:
+        update = Update.de_json(payload)
+        LOGGER.info("Incoming Telegram update_id=%s", getattr(update, "update_id", None))
+        bot.process_new_updates([update])
+    except Exception:
+        LOGGER.exception("Failed to process incoming Telegram update")
+        raise
+
     return "ok", 200
 
 
