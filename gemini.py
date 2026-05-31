@@ -16,7 +16,7 @@ LOGGER = logging.getLogger("nutrition_bot")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
+    "gemini-1.5-flash:generateContent"
 )
 GEMINI_SYSTEM_PROMPT = (
     "You are a nutrition and intent engine for a Telegram diet bot. Analyze the user's "
@@ -61,7 +61,10 @@ def _post_with_retry(payload: dict[str, Any], timeout: int = 60) -> dict[str, An
             return response.json()
 
         if response.status_code == 429:
-            LOGGER.warning("Gemini rate-limited (attempt=%s), retrying in %.1fs", attempt, delay)
+            LOGGER.warning(
+                "Gemini 429 (attempt=%s) body=%s, retrying in %.1fs",
+                attempt, response.text[:300], delay,
+            )
             time.sleep(delay)
             continue
 
