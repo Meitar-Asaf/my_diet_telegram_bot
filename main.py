@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import mimetypes
@@ -80,11 +79,13 @@ GEMINI_ENDPOINT = (
     "gemini-2.0-flash:generateContent"
 )
 GEMINI_SYSTEM_PROMPT = (
-    "You are a nutrition estimation engine. Analyze the user's food text or image and "
-    "estimate the total calories and protein for the described meal. Return only valid "
-    'JSON matching this schema exactly: {"calories": int, "protein": int}. '
-    "Always use integers. Never include explanations, markdown, or extra keys. If the "
-    "meal is unclear, make the best reasonable estimate from the available information."
+    "You are a nutrition and intent engine for a Telegram diet bot. Analyze the user's "
+    "text or image and decide whether it is a food log or regular chat. Return only valid "
+    "JSON with this exact schema: {\"is_food\": bool, \"calories\": int, \"protein\": int, \"chat_reply\": string}. "
+    "Rules: If the message is food logging, set is_food=true and estimate calories/protein with integers. "
+    "If the message is not food logging (greeting/small-talk/unrelated), set is_food=false, calories=0, protein=0, "
+    "and provide a short friendly chat_reply in the same language as the user's message. "
+    "Never return markdown or extra keys."
 )
 
 WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
@@ -92,25 +93,6 @@ webhook_lock = threading.Lock()
 webhook_initialized = False
 
 HEBREW_CHAR_PATTERN = re.compile(r"[\u0590-\u05FF]")
-SMALL_TALK_HE = {
-    "היי",
-    "הי",
-    "שלום",
-    "מה קורה",
-    "מה נשמע",
-    "בוקר טוב",
-    "ערב טוב",
-    "לילה טוב",
-}
-SMALL_TALK_EN = {
-    "hi",
-    "hey",
-    "hello",
-    "good morning",
-    "good evening",
-    "good night",
-    "how are you",
-}
 
 
 class GeminiRateLimitError(Exception):
@@ -120,12 +102,6 @@ class GeminiRateLimitError(Exception):
 def current_local_date() -> datetime.date:
     """Return the current date in the configured application timezone."""
     return datetime.now(LOCAL_TIMEZONE).date()
-
-
-def instance_fingerprint() -> str:
-    """Return a short deterministic fingerprint for the running bot instance."""
-    digest = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).hexdigest()
-    return digest[:8]
 
 
 def calorie_limit_for(day: datetime.date) -> int:
@@ -154,16 +130,6 @@ def detect_message_language(message: Message, text_hint: str | None = None) -> s
     return "en"
 
 
-def is_small_talk_or_non_food(text: str) -> bool:
-    """Detect obvious chat/small-talk locally to avoid extra Gemini calls."""
-    normalized = re.sub(r"\s+", " ", text.strip())
-    if not normalized:
-        return True
-
-    lowered = normalized.lower()
-    return lowered in SMALL_TALK_HE or lowered in SMALL_TALK_EN
-
-
 def message_text(lang: str, key: str) -> str:
     """Return localized UI strings for Hebrew and English replies."""
     messages = {
@@ -173,7 +139,7 @@ def message_text(lang: str, key: str) -> str:
             "photo_error": "לא הצלחתי לנתח את התמונה כרגע. נסי שוב עם תמונה ברורה יותר או הוסיפי כיתוב.",
             "text_error": "לא הצלחתי לנתח את תיאור הארוחה כרגע. נסי שוב עם פירוט קצת יותר ברור.",
             "gemini_busy": "יש כרגע עומס זמני בניתוח AI. נסי שוב בעוד כמה שניות.",
-            "ping": "הבוט פעיל על השרת. מזהה מופע",
+            "non_food_default": "קיבלתי. אם תרצי לעדכן תזונה, שלחי תיאור אוכל או תמונה של הארוחה.",
             "added_header": "נוספה הערכת ארוחה:",
             "calories_label": "קלוריות",
             "protein_label": "חלבון",
@@ -188,7 +154,7 @@ def message_text(lang: str, key: str) -> str:
             "photo_error": "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
             "text_error": "I could not analyze that meal description right now. Please try again with a more specific description.",
             "gemini_busy": "The AI analyzer is temporarily busy. Please try again in a few seconds.",
-            "ping": "Bot is live on server. Instance",
+            "non_food_default": "Got it. If you want to log nutrition, send a food description or a meal photo.",
             "added_header": "Added meal estimate:",
             "calories_label": "Calories",
             "protein_label": "Protein",
@@ -247,15 +213,15 @@ def call_gemini_for_food(
     food_text: str | None = None,
     image_bytes: bytes | None = None,
     image_mime_type: str | None = None,
-) -> dict[str, int]:
-    """Call Gemini Flash to estimate calories and protein from text or image input."""
+) -> dict[str, Any]:
+    """Call Gemini Flash to classify intent and estimate nutrition in one response."""
     if not food_text and not image_bytes:
         raise ValueError("Either food_text or image_bytes must be provided.")
 
     prompt_text = (
-        "Estimate nutrition for this entry and return JSON only."
+        "Classify and analyze this entry. Return JSON only."
         if not food_text
-        else f"Estimate nutrition for this entry and return JSON only: {food_text}"
+        else f"Classify and analyze this entry. Return JSON only: {food_text}"
     )
 
     user_parts: list[dict[str, Any]] = [{"text": prompt_text}]
@@ -290,9 +256,21 @@ def call_gemini_for_food(
         raise ValueError(f"Gemini returned no text response: {response_payload}")
 
     parsed = extract_json_object("\n".join(text_fragments))
-    calories = max(0, int(parsed["calories"]))
-    protein = max(0, int(parsed["protein"]))
-    return {"calories": calories, "protein": protein}
+    is_food = bool(parsed.get("is_food", True))
+    calories = max(0, int(parsed.get("calories", 0)))
+    protein = max(0, int(parsed.get("protein", 0)))
+    chat_reply = str(parsed.get("chat_reply", "")).strip()
+
+    if not is_food:
+        calories = 0
+        protein = 0
+
+    return {
+        "is_food": is_food,
+        "calories": calories,
+        "protein": protein,
+        "chat_reply": chat_reply,
+    }
 
 
 def create_db_connection() -> psycopg2.extensions.connection:
@@ -440,6 +418,14 @@ def handle_food_entry(
         image_bytes=image_bytes,
         image_mime_type=mime_type,
     )
+
+    if not analysis["is_food"]:
+        bot.reply_to(
+            message,
+            analysis["chat_reply"] or message_text(lang, "non_food_default"),
+        )
+        return
+
     updated_record = add_food_to_daily_totals(
         message.from_user.id,
         calories=analysis["calories"],
@@ -471,17 +457,6 @@ def show_today_totals(message: Message) -> None:
         "total_protein": 0,
     }
     bot.reply_to(message, format_daily_summary(record, entry_date, lang))
-
-
-@bot.message_handler(commands=["ping"])
-def ping(message: Message) -> None:
-    """Return runtime diagnostics to verify the active webhook server instance."""
-    lang = detect_message_language(message, message.text)
-    now_text = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
-    bot.reply_to(
-        message,
-        f"{message_text(lang, 'ping')}: {instance_fingerprint()}\nTime: {now_text}\nMode: {BOT_MODE}",
-    )
 
 
 @bot.message_handler(content_types=["photo"])
@@ -544,9 +519,6 @@ def handle_text(message: Message) -> None:
         return
 
     text = message.text.strip()
-    if is_small_talk_or_non_food(text):
-        bot.reply_to(message, message_text(lang, "small_talk"))
-        return
 
     try:
         handle_food_entry(message, text=text, image_bytes=None, lang=lang)
@@ -647,8 +619,6 @@ def telegram_webhook() -> tuple[str, int]:
                     send_welcome(message)
                 elif command == "/today":
                     show_today_totals(message)
-                elif command == "/ping":
-                    ping(message)
                 elif text.startswith("/"):
                     LOGGER.info("Ignoring unknown command text=%s", text)
                 else:
@@ -668,11 +638,7 @@ def telegram_webhook() -> tuple[str, int]:
 
 def main() -> None:
     """Run the bot in webhook mode for production or polling mode for local use."""
-    LOGGER.info(
-        "Starting nutrition bot in %s mode (instance=%s)",
-        BOT_MODE,
-        instance_fingerprint(),
-    )
+    LOGGER.info("Starting nutrition bot in %s mode", BOT_MODE)
 
     if BOT_MODE == "webhook":
         ensure_webhook()
