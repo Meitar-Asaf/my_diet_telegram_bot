@@ -87,6 +87,66 @@ WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
 webhook_lock = threading.Lock()
 webhook_initialized = False
 
+HEBREW_CHAR_PATTERN = re.compile(r"[\u0590-\u05FF]")
+FOOD_KEYWORDS_HE = {
+    "ארוחת",
+    "ארוחה",
+    "אכלתי",
+    "אוכל",
+    "לחם",
+    "ביצה",
+    "גבינה",
+    "אורז",
+    "עוף",
+    "פסטה",
+    "סלט",
+    "יוגורט",
+    "שייק",
+    "טונה",
+    "בשר",
+    "מרק",
+    "פרוסה",
+}
+FOOD_KEYWORDS_EN = {
+    "breakfast",
+    "lunch",
+    "dinner",
+    "meal",
+    "ate",
+    "food",
+    "bread",
+    "rice",
+    "chicken",
+    "egg",
+    "eggs",
+    "cheese",
+    "salad",
+    "pasta",
+    "protein",
+    "sandwich",
+    "yogurt",
+    "tuna",
+}
+SMALL_TALK_HE = {
+    "היי",
+    "הי",
+    "שלום",
+    "מה קורה",
+    "מה נשמע",
+    "בוקר טוב",
+    "ערב טוב",
+    "לילה טוב",
+}
+SMALL_TALK_EN = {
+    "hi",
+    "hey",
+    "hello",
+    "good morning",
+    "good evening",
+    "good night",
+    "how are you",
+}
+
 
 def current_local_date() -> datetime.date:
     """Return the current date in the configured application timezone."""
@@ -101,6 +161,73 @@ def calorie_limit_for(day: datetime.date) -> int:
 def protein_goal() -> int:
     """Return the daily protein target in grams."""
     return 100
+
+
+def detect_language_from_text(text: str) -> str:
+    """Detect reply language from message content (Hebrew or English)."""
+    return "he" if HEBREW_CHAR_PATTERN.search(text or "") else "en"
+
+
+def detect_message_language(message: Message, text_hint: str | None = None) -> str:
+    """Detect preferred reply language from text or Telegram user language code."""
+    if text_hint and text_hint.strip():
+        return detect_language_from_text(text_hint)
+
+    language_code = (getattr(message.from_user, "language_code", "") or "").lower()
+    if language_code.startswith("he"):
+        return "he"
+    return "en"
+
+
+def is_small_talk_or_non_food(text: str) -> bool:
+    """Return True when text looks like greeting/small-talk and not a food log."""
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if not normalized:
+        return True
+
+    if normalized in SMALL_TALK_HE or normalized in SMALL_TALK_EN:
+        return True
+
+    words = set(re.findall(r"[\w\u0590-\u05FF]+", normalized))
+    has_food_keyword = bool(words & FOOD_KEYWORDS_HE) or bool(words & FOOD_KEYWORDS_EN)
+
+    # Very short free-text without food words is usually not a meal record.
+    if not has_food_keyword and len(words) <= 2:
+        return True
+    return False
+
+
+def message_text(lang: str, key: str) -> str:
+    """Return localized UI strings for Hebrew and English replies."""
+    messages = {
+        "he": {
+            "welcome": "שלחי תיאור ארוחה או תמונת אוכל. אני אעריך קלוריות וחלבון, אשמור סיכום יומי ואעקוב אחרי היעדים שלך.",
+            "small_talk": "בשמחה. כדי לעדכן יומן תזונה, שלחי תיאור אוכל (למשל: שתי פרוסות לחם לבן וגבינה) או תמונה של הארוחה.",
+            "photo_error": "לא הצלחתי לנתח את התמונה כרגע. נסי שוב עם תמונה ברורה יותר או הוסיפי כיתוב.",
+            "text_error": "לא הצלחתי לנתח את תיאור הארוחה כרגע. נסי שוב עם פירוט קצת יותר ברור.",
+            "added_header": "נוספה הערכת ארוחה:",
+            "calories_label": "קלוריות",
+            "protein_label": "חלבון",
+            "regular_day": "יום רגיל",
+            "cheat_day": "יום צ'יט",
+            "totals_for": "סיכום יומי לתאריך",
+            "remaining": "נותר",
+        },
+        "en": {
+            "welcome": "Send a food description or a meal photo. I will estimate calories and protein, save today's totals, and track your goals.",
+            "small_talk": "Happy to help. To log nutrition, send a food description (for example: two slices of white bread) or a meal photo.",
+            "photo_error": "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
+            "text_error": "I could not analyze that meal description right now. Please try again with a more specific description.",
+            "added_header": "Added meal estimate:",
+            "calories_label": "Calories",
+            "protein_label": "Protein",
+            "regular_day": "Regular day",
+            "cheat_day": "Cheat day",
+            "totals_for": "Daily totals for",
+            "remaining": "remaining",
+        },
+    }
+    return messages[lang][key]
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -255,19 +382,30 @@ def add_food_to_daily_totals(
     )
 
 
-def format_daily_summary(record: dict[str, Any], entry_date: datetime.date) -> str:
+def format_daily_summary(record: dict[str, Any], entry_date: datetime.date, lang: str) -> str:
     """Format a readable daily summary with limits, goals, and remaining amounts."""
     total_calories = int(record["total_calories"])
     total_protein = int(record["total_protein"])
     calorie_limit = calorie_limit_for(entry_date)
     remaining_calories = calorie_limit - total_calories
     remaining_protein = protein_goal() - total_protein
-    day_type = "Cheat day" if calorie_limit == 2550 else "Regular day"
+    day_type = (
+        message_text(lang, "cheat_day")
+        if calorie_limit == 2550
+        else message_text(lang, "regular_day")
+    )
+
+    if lang == "he":
+        return (
+            f"{day_type} - {message_text(lang, 'totals_for')} {entry_date.isoformat()}\n"
+            f"{message_text(lang, 'calories_label')}: {total_calories}/{calorie_limit} ({remaining_calories:+d} {message_text(lang, 'remaining')})\n"
+            f"{message_text(lang, 'protein_label')}: {total_protein}/{protein_goal()} גרם ({remaining_protein:+d} גרם {message_text(lang, 'remaining')})"
+        )
 
     return (
-        f"{day_type} totals for {entry_date.isoformat()}\n"
-        f"Calories: {total_calories}/{calorie_limit} ({remaining_calories:+d} remaining)\n"
-        f"Protein: {total_protein}/{protein_goal()}g ({remaining_protein:+d}g remaining)"
+        f"{day_type} {message_text(lang, 'totals_for')} {entry_date.isoformat()}\n"
+        f"{message_text(lang, 'calories_label')}: {total_calories}/{calorie_limit} ({remaining_calories:+d} {message_text(lang, 'remaining')})\n"
+        f"{message_text(lang, 'protein_label')}: {total_protein}/{protein_goal()}g ({remaining_protein:+d}g {message_text(lang, 'remaining')})"
     )
 
 
@@ -275,17 +413,25 @@ def build_analysis_reply(
     analysis: dict[str, int],
     updated_record: dict[str, Any],
     entry_date: datetime.date,
+    lang: str,
 ) -> str:
     """Build the Telegram reply after adding a meal estimate to daily totals."""
+    protein_unit = " גרם" if lang == "he" else "g"
     return (
-        f"Added meal estimate:\n"
-        f"Calories: {analysis['calories']}\n"
-        f"Protein: {analysis['protein']}g\n\n"
-        f"{format_daily_summary(updated_record, entry_date)}"
+        f"{message_text(lang, 'added_header')}\n"
+        f"{message_text(lang, 'calories_label')}: {analysis['calories']}\n"
+        f"{message_text(lang, 'protein_label')}: {analysis['protein']}{protein_unit}\n\n"
+        f"{format_daily_summary(updated_record, entry_date, lang)}"
     )
 
 
-def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes | None) -> None:
+def handle_food_entry(
+    message: Message,
+    *,
+    text: str | None,
+    image_bytes: bytes | None,
+    lang: str,
+) -> None:
     """Analyze one food entry and store its nutrition impact for the current day."""
     LOGGER.info(
         "Handling food entry user_id=%s has_text=%s has_image=%s",
@@ -309,17 +455,17 @@ def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes 
         protein=analysis["protein"],
         entry_date=entry_date,
     )
-    bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date))
+    bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date, lang))
 
 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message: Message) -> None:
     """Send help text for first-time users and command guidance."""
     LOGGER.info("Handling /start or /help for user_id=%s", message.from_user.id)
+    lang = detect_message_language(message, message.text)
     bot.reply_to(
         message,
-        "Send a food description or a meal photo. I will estimate calories and protein, "
-        "save the totals for today, and track them against your daily goals.",
+        message_text(lang, "welcome"),
     )
 
 
@@ -327,12 +473,13 @@ def send_welcome(message: Message) -> None:
 def show_today_totals(message: Message) -> None:
     """Show today's accumulated calories and protein for the current user."""
     LOGGER.info("Handling /today for user_id=%s", message.from_user.id)
+    lang = detect_message_language(message, message.text)
     entry_date = current_local_date()
     record = get_daily_nutrition(message.from_user.id, entry_date) or {
         "total_calories": 0,
         "total_protein": 0,
     }
-    bot.reply_to(message, format_daily_summary(record, entry_date))
+    bot.reply_to(message, format_daily_summary(record, entry_date, lang))
 
 
 @bot.message_handler(content_types=["photo"])
@@ -347,6 +494,7 @@ def handle_photo(message: Message) -> None:
 
         guessed_mime_type, _ = mimetypes.guess_type(file_info.file_path)
         image_mime_type = guessed_mime_type or "image/jpeg"
+        lang = detect_message_language(message, caption)
         analysis = call_gemini_for_food(
             food_text=caption,
             image_bytes=downloaded_bytes,
@@ -359,12 +507,13 @@ def handle_photo(message: Message) -> None:
             protein=analysis["protein"],
             entry_date=entry_date,
         )
-        bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date))
+        bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date, lang))
     except Exception:
         LOGGER.exception("Failed to process photo message")
+        lang = detect_message_language(message, message.caption)
         bot.reply_to(
             message,
-            "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
+            message_text(lang, "photo_error"),
         )
 
 
@@ -372,17 +521,23 @@ def handle_photo(message: Message) -> None:
 def handle_text(message: Message) -> None:
     """Handle plain text meal descriptions and ignore unknown slash commands."""
     LOGGER.info("Handling text message for user_id=%s", message.from_user.id)
+    lang = detect_message_language(message, message.text)
     if message.text.startswith("/"):
         LOGGER.info("Ignoring unknown command text=%s", message.text)
         return
 
+    text = message.text.strip()
+    if is_small_talk_or_non_food(text):
+        bot.reply_to(message, message_text(lang, "small_talk"))
+        return
+
     try:
-        handle_food_entry(message, text=message.text.strip(), image_bytes=None)
+        handle_food_entry(message, text=text, image_bytes=None, lang=lang)
     except Exception:
         LOGGER.exception("Failed to process text message")
         bot.reply_to(
             message,
-            "I could not analyze that meal description right now. Please try again with a more specific description.",
+            message_text(lang, "text_error"),
         )
 
 
@@ -447,12 +602,29 @@ def telegram_webhook() -> tuple[str, int]:
 
         # In webhook mode we only subscribe to message updates, so dispatch directly.
         if update.message is not None:
+            message = update.message
             LOGGER.info(
                 "Dispatching message update content_type=%s user_id=%s",
-                update.message.content_type,
-                update.message.from_user.id if update.message.from_user else None,
+                message.content_type,
+                message.from_user.id if message.from_user else None,
             )
-            bot.process_new_messages([update.message])
+
+            # Manual routing in webhook mode to avoid dispatcher edge-cases.
+            if message.content_type == "text":
+                text = (message.text or "").strip()
+                command = text.split()[0].split("@")[0].lower() if text else ""
+                if command in {"/start", "/help"}:
+                    send_welcome(message)
+                elif command == "/today":
+                    show_today_totals(message)
+                elif text.startswith("/"):
+                    LOGGER.info("Ignoring unknown command text=%s", text)
+                else:
+                    handle_text(message)
+            elif message.content_type == "photo":
+                handle_photo(message)
+            else:
+                LOGGER.info("Ignoring unsupported content_type=%s", message.content_type)
         else:
             LOGGER.info("Skipping non-message update_id=%s", getattr(update, "update_id", None))
     except Exception:
