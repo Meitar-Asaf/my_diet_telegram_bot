@@ -437,14 +437,24 @@ def telegram_webhook() -> tuple[str, int]:
     if not request.is_json:
         abort(403)
 
-    payload = request.get_json(silent=True)
-    if not payload:
+    raw_update = request.get_data(as_text=True)
+    if not raw_update:
         abort(400)
 
     try:
-        update = Update.de_json(payload)
+        update = Update.de_json(raw_update)
         LOGGER.info("Incoming Telegram update_id=%s", getattr(update, "update_id", None))
-        bot.process_new_updates([update])
+
+        # In webhook mode we only subscribe to message updates, so dispatch directly.
+        if update.message is not None:
+            LOGGER.info(
+                "Dispatching message update content_type=%s user_id=%s",
+                update.message.content_type,
+                update.message.from_user.id if update.message.from_user else None,
+            )
+            bot.process_new_messages([update.message])
+        else:
+            LOGGER.info("Skipping non-message update_id=%s", getattr(update, "update_id", None))
     except Exception:
         LOGGER.exception("Failed to process incoming Telegram update")
         raise
