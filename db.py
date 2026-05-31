@@ -91,3 +91,113 @@ def add_food_to_daily_totals(
         total_calories=int(existing["total_calories"]) + calories,
         total_protein=int(existing["total_protein"]) + protein,
     )
+
+
+def add_food_entry(
+    user_id: int,
+    *,
+    description: str,
+    calories: int,
+    protein: int,
+    entry_date: datetime.date,
+) -> dict[str, Any]:
+    """Insert a food_log row and increment daily totals atomically. Returns inserted row."""
+    with create_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO food_log (user_id, date, description, calories, protein)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, description, calories, protein
+                """,
+                (user_id, entry_date, description, calories, protein),
+            )
+            row = dict(cur.fetchone())
+            cur.execute(
+                """
+                INSERT INTO daily_nutrition (user_id, date, total_calories, total_protein)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, date) DO UPDATE SET
+                    total_calories = daily_nutrition.total_calories + EXCLUDED.total_calories,
+                    total_protein  = daily_nutrition.total_protein  + EXCLUDED.total_protein
+                """,
+                (user_id, entry_date, calories, protein),
+            )
+    return row
+
+
+def get_today_food_log(user_id: int, entry_date: datetime.date) -> list[dict[str, Any]]:
+    """Return today's individual food entries for a user, oldest first."""
+    with create_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, description, calories, protein
+                FROM food_log
+                WHERE user_id = %s AND date = %s
+                ORDER BY created_at ASC
+                """,
+                (user_id, entry_date),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def delete_food_entry(entry_id: int, user_id: int) -> dict[str, Any] | None:
+    """Delete a food_log entry (with ownership check) and subtract from daily totals."""
+    with create_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                DELETE FROM food_log
+                WHERE id = %s AND user_id = %s
+                RETURNING id, description, calories, protein, date
+                """,
+                (entry_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            cur.execute(
+                """
+                UPDATE daily_nutrition
+                SET total_calories = GREATEST(0, total_calories - %s),
+                    total_protein  = GREATEST(0, total_protein  - %s)
+                WHERE user_id = %s AND date = %s
+                """,
+                (row["calories"], row["protein"], user_id, row["date"]),
+            )
+    return row
+
+
+def undo_last_food_entry(user_id: int, entry_date: datetime.date) -> dict[str, Any] | None:
+    """Delete the most recent food_log entry for today and update totals."""
+    with create_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                DELETE FROM food_log
+                WHERE id = (
+                    SELECT id FROM food_log
+                    WHERE user_id = %s AND date = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                RETURNING id, description, calories, protein, date
+                """,
+                (user_id, entry_date),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            cur.execute(
+                """
+                UPDATE daily_nutrition
+                SET total_calories = GREATEST(0, total_calories - %s),
+                    total_protein  = GREATEST(0, total_protein  - %s)
+                WHERE user_id = %s AND date = %s
+                """,
+                (row["calories"], row["protein"], user_id, entry_date),
+            )
+    return row

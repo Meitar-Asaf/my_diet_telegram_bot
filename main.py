@@ -13,7 +13,17 @@ logging.basicConfig(
 from flask import Flask, abort, request
 from telebot.types import Update
 
-from handlers import bot, handle_photo, handle_text, ping, send_welcome, show_today_totals
+from handlers import (
+    bot,
+    handle_callback_query,
+    handle_photo,
+    handle_text,
+    handle_undo,
+    ping,
+    send_welcome,
+    show_food_list,
+    show_today_totals,
+)
 
 LOGGER = logging.getLogger("nutrition_bot")
 
@@ -63,7 +73,7 @@ def ensure_webhook() -> None:
             return
         url = _webhook_url()
         bot.remove_webhook()
-        if not bot.set_webhook(url=url, allowed_updates=["message"]):
+        if not bot.set_webhook(url=url, allowed_updates=["message", "callback_query"]):
             raise RuntimeError("Failed to register Telegram webhook.")
         _webhook_initialized = True
         LOGGER.info("Webhook registered at %s", url)
@@ -92,6 +102,10 @@ def _dispatch(message) -> None:
                 send_welcome(message)
             elif command == "/today":
                 show_today_totals(message)
+            elif command == "/list":
+                show_food_list(message)
+            elif command == "/undo":
+                handle_undo(message)
             elif command == "/ping":
                 ping(message)
             elif text.startswith("/"):
@@ -119,6 +133,8 @@ def telegram_webhook() -> tuple[str, int]:
         LOGGER.info("Incoming update_id=%s", getattr(update, "update_id", None))
         if update.message is not None:
             threading.Thread(target=_dispatch, args=(update.message,), daemon=True).start()
+        if update.callback_query is not None:
+            threading.Thread(target=handle_callback_query, args=(update.callback_query,), daemon=True).start()
     except Exception:
         LOGGER.exception("Failed to parse Telegram update")
     return "ok", 200
