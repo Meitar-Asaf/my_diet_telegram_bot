@@ -13,7 +13,17 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: DATABASE_URL
+      - key: DB_HOST
+        value: aws-1-ap-northeast-2.pooler.supabase.com
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_NAME
+        value: postgres
+      - key: DB_USER
+        value: postgres.nhshdjsejokvgzumlrsf
+      - key: DB_SSLMODE
+        value: require
+      - key: DB_PASSWORD
         sync: false
       - key: WEBHOOK_BASE_URL
         sync: false

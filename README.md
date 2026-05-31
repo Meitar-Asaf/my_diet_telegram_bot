@@ -28,10 +28,17 @@ Set these in Render:
 
 - `TELEGRAM_BOT_TOKEN`
 - `GEMINI_API_KEY`
-- `DATABASE_URL`
+- `DB_HOST`
+- `DB_PORT`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
+- `DB_SSLMODE`
 - `WEBHOOK_BASE_URL`
 - `APP_TIMEZONE`
 - `BOT_MODE=webhook`
+
+The app also supports `DATABASE_URL` as an alternative, but with the provided `render.yaml` you only need to fill `DB_PASSWORD` as the database secret.
 
 `WEBHOOK_BASE_URL` should be your Render app URL, for example:
 

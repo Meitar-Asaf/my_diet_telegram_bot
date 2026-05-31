@@ -28,18 +28,36 @@ LOGGER = logging.getLogger("nutrition_bot")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_HOST = os.getenv("DB_HOST", "")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_USER = os.getenv("DB_USER", "")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "UTC")
 BOT_MODE = os.getenv("BOT_MODE", "webhook" if os.getenv("RENDER") else "polling")
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
-REQUIRED_ENV_VARS = {
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
-    "DATABASE_URL": DATABASE_URL,
-}
+missing_env_vars = []
+if not TELEGRAM_BOT_TOKEN:
+    missing_env_vars.append("TELEGRAM_BOT_TOKEN")
+if not GEMINI_API_KEY:
+    missing_env_vars.append("GEMINI_API_KEY")
 
-missing_env_vars = [name for name, value in REQUIRED_ENV_VARS.items() if not value]
+# Accept either DATABASE_URL or split DB_* settings.
+if not DATABASE_URL:
+    split_db_vars = {
+        "DB_HOST": DB_HOST,
+        "DB_PORT": DB_PORT,
+        "DB_NAME": DB_NAME,
+        "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD,
+    }
+    missing_env_vars.extend(
+        [name for name, value in split_db_vars.items() if not value]
+    )
+
 if missing_env_vars:
     raise RuntimeError(
         "Missing required environment variables: " + ", ".join(missing_env_vars)
@@ -71,18 +89,22 @@ webhook_initialized = False
 
 
 def current_local_date() -> datetime.date:
+    """Return the current date in the configured application timezone."""
     return datetime.now(LOCAL_TIMEZONE).date()
 
 
 def calorie_limit_for(day: datetime.date) -> int:
+    """Return the daily calorie limit, using Saturday as the cheat day."""
     return 2550 if day.weekday() == 5 else 1500
 
 
 def protein_goal() -> int:
+    """Return the daily protein target in grams."""
     return 100
 
 
 def extract_json_object(raw_text: str) -> dict[str, Any]:
+    """Extract and parse a JSON object from raw model output text."""
     stripped = raw_text.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         return json.loads(stripped)
@@ -100,6 +122,7 @@ def call_gemini_for_food(
     image_bytes: bytes | None = None,
     image_mime_type: str | None = None,
 ) -> dict[str, int]:
+    """Call Gemini Flash to estimate calories and protein from text or image input."""
     if not food_text and not image_bytes:
         raise ValueError("Either food_text or image_bytes must be provided.")
 
@@ -154,8 +177,24 @@ def call_gemini_for_food(
     return {"calories": calories, "protein": protein}
 
 
+def create_db_connection() -> psycopg2.extensions.connection:
+    """Create a PostgreSQL connection from DATABASE_URL or split DB_* settings."""
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL)
+
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        sslmode=DB_SSLMODE,
+    )
+
+
 def get_daily_nutrition(user_id: int, entry_date: datetime.date) -> dict[str, Any] | None:
-    with psycopg2.connect(DATABASE_URL) as conn:
+    """Fetch the user's nutrition totals for a specific date from PostgreSQL."""
+    with create_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
@@ -176,7 +215,8 @@ def upsert_daily_nutrition(
     total_calories: int,
     total_protein: int,
 ) -> dict[str, Any]:
-    with psycopg2.connect(DATABASE_URL) as conn:
+    """Insert or update the daily nutrition totals for a user and date."""
+    with create_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
@@ -200,6 +240,7 @@ def add_food_to_daily_totals(
     protein: int,
     entry_date: datetime.date,
 ) -> dict[str, Any]:
+    """Add one meal estimate to the existing daily totals and persist the result."""
     existing = get_daily_nutrition(user_id, entry_date) or {
         "total_calories": 0,
         "total_protein": 0,
@@ -215,6 +256,7 @@ def add_food_to_daily_totals(
 
 
 def format_daily_summary(record: dict[str, Any], entry_date: datetime.date) -> str:
+    """Format a readable daily summary with limits, goals, and remaining amounts."""
     total_calories = int(record["total_calories"])
     total_protein = int(record["total_protein"])
     calorie_limit = calorie_limit_for(entry_date)
@@ -234,6 +276,7 @@ def build_analysis_reply(
     updated_record: dict[str, Any],
     entry_date: datetime.date,
 ) -> str:
+    """Build the Telegram reply after adding a meal estimate to daily totals."""
     return (
         f"Added meal estimate:\n"
         f"Calories: {analysis['calories']}\n"
@@ -243,6 +286,7 @@ def build_analysis_reply(
 
 
 def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes | None) -> None:
+    """Analyze one food entry and store its nutrition impact for the current day."""
     entry_date = current_local_date()
     mime_type = None
     if image_bytes:
@@ -264,6 +308,7 @@ def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes 
 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message: Message) -> None:
+    """Send help text for first-time users and command guidance."""
     bot.reply_to(
         message,
         "Send a food description or a meal photo. I will estimate calories and protein, "
@@ -273,6 +318,7 @@ def send_welcome(message: Message) -> None:
 
 @bot.message_handler(commands=["today"])
 def show_today_totals(message: Message) -> None:
+    """Show today's accumulated calories and protein for the current user."""
     entry_date = current_local_date()
     record = get_daily_nutrition(message.from_user.id, entry_date) or {
         "total_calories": 0,
@@ -283,6 +329,7 @@ def show_today_totals(message: Message) -> None:
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: Message) -> None:
+    """Handle photo messages by estimating nutrition from image and caption."""
     try:
         largest_photo = message.photo[-1]
         file_info = bot.get_file(largest_photo.file_id)
@@ -314,6 +361,7 @@ def handle_photo(message: Message) -> None:
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def handle_text(message: Message) -> None:
+    """Handle plain text meal descriptions and ignore unknown slash commands."""
     if message.text.startswith("/"):
         return
 
@@ -328,12 +376,14 @@ def handle_text(message: Message) -> None:
 
 
 def webhook_url() -> str:
+    """Build the full Telegram webhook URL from the configured base URL."""
     if not WEBHOOK_BASE_URL:
         raise RuntimeError("WEBHOOK_BASE_URL is required when BOT_MODE=webhook.")
     return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 
 
 def ensure_webhook() -> None:
+    """Register Telegram webhook once per process in webhook mode."""
     global webhook_initialized
 
     if BOT_MODE != "webhook" or webhook_initialized:
@@ -354,17 +404,20 @@ def ensure_webhook() -> None:
 
 @app.before_request
 def initialize_webhook_before_requests() -> None:
+    """Ensure webhook is initialized before serving incoming HTTP requests."""
     if BOT_MODE == "webhook":
         ensure_webhook()
 
 
 @app.get("/healthz")
 def healthcheck() -> tuple[dict[str, str], int]:
+    """Return a simple health response for Render and uptime checks."""
     return {"status": "ok", "mode": BOT_MODE}, 200
 
 
 @app.post(WEBHOOK_PATH)
 def telegram_webhook() -> tuple[str, int]:
+    """Receive Telegram updates and forward them into the bot dispatcher."""
     if not request.is_json:
         abort(403)
 
@@ -374,6 +427,7 @@ def telegram_webhook() -> tuple[str, int]:
 
 
 def main() -> None:
+    """Run the bot in webhook mode for production or polling mode for local use."""
     LOGGER.info("Starting nutrition bot in %s mode", BOT_MODE)
 
     if BOT_MODE == "webhook":
