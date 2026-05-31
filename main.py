@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -121,6 +122,12 @@ def current_local_date() -> datetime.date:
     return datetime.now(LOCAL_TIMEZONE).date()
 
 
+def instance_fingerprint() -> str:
+    """Return a short deterministic fingerprint for the running bot instance."""
+    digest = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).hexdigest()
+    return digest[:8]
+
+
 def calorie_limit_for(day: datetime.date) -> int:
     """Return the daily calorie limit, using Saturday as the cheat day."""
     return 2550 if day.weekday() == 5 else 1500
@@ -170,6 +177,7 @@ def message_text(lang: str, key: str) -> str:
             "photo_error": "לא הצלחתי לנתח את התמונה כרגע. נסי שוב עם תמונה ברורה יותר או הוסיפי כיתוב.",
             "text_error": "לא הצלחתי לנתח את תיאור הארוחה כרגע. נסי שוב עם פירוט קצת יותר ברור.",
             "gemini_busy": "יש כרגע עומס זמני בניתוח AI. נסי שוב בעוד כמה שניות.",
+            "ping": "הבוט פעיל על השרת. מזהה מופע",
             "added_header": "נוספה הערכת ארוחה:",
             "calories_label": "קלוריות",
             "protein_label": "חלבון",
@@ -184,6 +192,7 @@ def message_text(lang: str, key: str) -> str:
             "photo_error": "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
             "text_error": "I could not analyze that meal description right now. Please try again with a more specific description.",
             "gemini_busy": "The AI analyzer is temporarily busy. Please try again in a few seconds.",
+            "ping": "Bot is live on server. Instance",
             "added_header": "Added meal estimate:",
             "calories_label": "Calories",
             "protein_label": "Protein",
@@ -468,6 +477,17 @@ def show_today_totals(message: Message) -> None:
     bot.reply_to(message, format_daily_summary(record, entry_date, lang))
 
 
+@bot.message_handler(commands=["ping"])
+def ping(message: Message) -> None:
+    """Return runtime diagnostics to verify the active webhook server instance."""
+    lang = detect_message_language(message, message.text)
+    now_text = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
+    bot.reply_to(
+        message,
+        f"{message_text(lang, 'ping')}: {instance_fingerprint()}\nTime: {now_text}\nMode: {BOT_MODE}",
+    )
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: Message) -> None:
     """Handle photo messages by estimating nutrition from image and caption."""
@@ -631,6 +651,8 @@ def telegram_webhook() -> tuple[str, int]:
                     send_welcome(message)
                 elif command == "/today":
                     show_today_totals(message)
+                elif command == "/ping":
+                    ping(message)
                 elif text.startswith("/"):
                     LOGGER.info("Ignoring unknown command text=%s", text)
                 else:
@@ -650,7 +672,11 @@ def telegram_webhook() -> tuple[str, int]:
 
 def main() -> None:
     """Run the bot in webhook mode for production or polling mode for local use."""
-    LOGGER.info("Starting nutrition bot in %s mode", BOT_MODE)
+    LOGGER.info(
+        "Starting nutrition bot in %s mode (instance=%s)",
+        BOT_MODE,
+        instance_fingerprint(),
+    )
 
     if BOT_MODE == "webhook":
         ensure_webhook()
