@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,6 +16,8 @@ from flask import Flask, abort, request
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
+from requests import Response
+from requests.exceptions import HTTPError
 import telebot
 from telebot.types import Message, Update
 
@@ -88,6 +91,29 @@ webhook_lock = threading.Lock()
 webhook_initialized = False
 
 HEBREW_CHAR_PATTERN = re.compile(r"[\u0590-\u05FF]")
+SMALL_TALK_HE = {
+    "היי",
+    "הי",
+    "שלום",
+    "מה קורה",
+    "מה נשמע",
+    "בוקר טוב",
+    "ערב טוב",
+    "לילה טוב",
+}
+SMALL_TALK_EN = {
+    "hi",
+    "hey",
+    "hello",
+    "good morning",
+    "good evening",
+    "good night",
+    "how are you",
+}
+
+
+class GeminiRateLimitError(Exception):
+    """Raised when Gemini keeps returning 429 rate-limit responses."""
 
 
 def current_local_date() -> datetime.date:
@@ -122,52 +148,17 @@ def detect_message_language(message: Message, text_hint: str | None = None) -> s
 
 
 def is_small_talk_or_non_food(text: str) -> bool:
-    """Use Gemini to classify whether text should be handled as food logging input."""
+    """Detect obvious chat/small-talk locally to avoid extra Gemini calls."""
     normalized = re.sub(r"\s+", " ", text.strip())
     if not normalized:
         return True
 
-    classifier_prompt = (
-        "Classify the user message intent for a nutrition logger bot. "
-        "Return JSON only in this exact format: {\"is_food\": true|false}. "
-        "Set is_food=true when the user likely describes food intake, meals, ingredients, "
-        "quantities, drinks, or asks to log nutrition. Set is_food=false for greetings, casual chat, "
-        "small talk, jokes, or unrelated questions.\n"
-        f"User message: {normalized}"
-    )
+    lowered = normalized.lower()
+    if lowered in SMALL_TALK_HE or lowered in SMALL_TALK_EN:
+        return True
 
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": classifier_prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-        },
-    }
-
-    try:
-        response = requests.post(
-            f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=20,
-        )
-        response.raise_for_status()
-        response_payload = response.json()
-        candidates = response_payload.get("candidates") or []
-        if not candidates:
-            return False
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text_fragments = [part.get("text", "") for part in parts if "text" in part]
-        if not text_fragments:
-            return False
-
-        parsed = extract_json_object("\n".join(text_fragments))
-        return not bool(parsed.get("is_food", False))
-    except Exception:
-        LOGGER.exception("Intent classification failed; defaulting to food analysis")
-        # On classifier failure, continue with nutrition analysis so logging still works.
-        return False
+    words = re.findall(r"[\w\u0590-\u05FF]+", lowered)
+    return len(words) <= 2 and not any(ch.isdigit() for ch in lowered)
 
 
 def message_text(lang: str, key: str) -> str:
@@ -178,6 +169,7 @@ def message_text(lang: str, key: str) -> str:
             "small_talk": "בשמחה. כדי לעדכן יומן תזונה, שלחי תיאור אוכל (למשל: שתי פרוסות לחם לבן וגבינה) או תמונה של הארוחה.",
             "photo_error": "לא הצלחתי לנתח את התמונה כרגע. נסי שוב עם תמונה ברורה יותר או הוסיפי כיתוב.",
             "text_error": "לא הצלחתי לנתח את תיאור הארוחה כרגע. נסי שוב עם פירוט קצת יותר ברור.",
+            "gemini_busy": "יש כרגע עומס זמני בניתוח AI. נסי שוב בעוד כמה שניות.",
             "added_header": "נוספה הערכת ארוחה:",
             "calories_label": "קלוריות",
             "protein_label": "חלבון",
@@ -191,6 +183,7 @@ def message_text(lang: str, key: str) -> str:
             "small_talk": "Happy to help. To log nutrition, send a food description (for example: two slices of white bread) or a meal photo.",
             "photo_error": "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
             "text_error": "I could not analyze that meal description right now. Please try again with a more specific description.",
+            "gemini_busy": "The AI analyzer is temporarily busy. Please try again in a few seconds.",
             "added_header": "Added meal estimate:",
             "calories_label": "Calories",
             "protein_label": "Protein",
@@ -214,6 +207,34 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
         raise ValueError(f"Gemini response did not include JSON: {raw_text}")
 
     return json.loads(match.group(0))
+
+
+def is_rate_limited(response: Response) -> bool:
+    """Return True when an HTTP response indicates API rate limiting."""
+    return response.status_code == 429
+
+
+def post_gemini_with_retry(payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+    """Call Gemini with short retry/backoff for transient 429 responses."""
+    for attempt, delay in enumerate((1.0, 2.0, 4.0), start=1):
+        response = requests.post(
+            f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout,
+        )
+
+        if response.ok:
+            return response.json()
+
+        if is_rate_limited(response):
+            LOGGER.warning("Gemini rate-limited (attempt=%s), retrying in %.1fs", attempt, delay)
+            time.sleep(delay)
+            continue
+
+        response.raise_for_status()
+
+    raise GeminiRateLimitError("Gemini is rate-limited. Try again shortly.")
 
 
 def call_gemini_for_food(
@@ -253,15 +274,7 @@ def call_gemini_for_food(
         },
     }
 
-    response = requests.post(
-        f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=60,
-    )
-    response.raise_for_status()
-
-    response_payload = response.json()
+    response_payload = post_gemini_with_retry(payload, timeout=60)
     candidates = response_payload.get("candidates") or []
     if not candidates:
         raise ValueError(f"Gemini returned no candidates: {response_payload}")
@@ -481,6 +494,21 @@ def handle_photo(message: Message) -> None:
             entry_date=entry_date,
         )
         bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date, lang))
+    except GeminiRateLimitError:
+        LOGGER.warning("Gemini rate-limited for photo user_id=%s", message.from_user.id)
+        lang = detect_message_language(message, message.caption)
+        bot.reply_to(message, message_text(lang, "gemini_busy"))
+    except HTTPError as exc:
+        lang = detect_message_language(message, message.caption)
+        if exc.response is not None and exc.response.status_code == 429:
+            LOGGER.warning("Gemini 429 for photo user_id=%s", message.from_user.id)
+            bot.reply_to(message, message_text(lang, "gemini_busy"))
+            return
+        LOGGER.exception("Failed to process photo message")
+        bot.reply_to(
+            message,
+            message_text(lang, "photo_error"),
+        )
     except Exception:
         LOGGER.exception("Failed to process photo message")
         lang = detect_message_language(message, message.caption)
@@ -506,6 +534,19 @@ def handle_text(message: Message) -> None:
 
     try:
         handle_food_entry(message, text=text, image_bytes=None, lang=lang)
+    except GeminiRateLimitError:
+        LOGGER.warning("Gemini rate-limited for text user_id=%s", message.from_user.id)
+        bot.reply_to(message, message_text(lang, "gemini_busy"))
+    except HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 429:
+            LOGGER.warning("Gemini 429 for text user_id=%s", message.from_user.id)
+            bot.reply_to(message, message_text(lang, "gemini_busy"))
+            return
+        LOGGER.exception("Failed to process text message")
+        bot.reply_to(
+            message,
+            message_text(lang, "text_error"),
+        )
     except Exception:
         LOGGER.exception("Failed to process text message")
         bot.reply_to(
