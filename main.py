@@ -287,6 +287,12 @@ def build_analysis_reply(
 
 def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes | None) -> None:
     """Analyze one food entry and store its nutrition impact for the current day."""
+    LOGGER.info(
+        "Handling food entry user_id=%s has_text=%s has_image=%s",
+        message.from_user.id,
+        bool(text),
+        bool(image_bytes),
+    )
     entry_date = current_local_date()
     mime_type = None
     if image_bytes:
@@ -309,6 +315,7 @@ def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message: Message) -> None:
     """Send help text for first-time users and command guidance."""
+    LOGGER.info("Handling /start or /help for user_id=%s", message.from_user.id)
     bot.reply_to(
         message,
         "Send a food description or a meal photo. I will estimate calories and protein, "
@@ -319,6 +326,7 @@ def send_welcome(message: Message) -> None:
 @bot.message_handler(commands=["today"])
 def show_today_totals(message: Message) -> None:
     """Show today's accumulated calories and protein for the current user."""
+    LOGGER.info("Handling /today for user_id=%s", message.from_user.id)
     entry_date = current_local_date()
     record = get_daily_nutrition(message.from_user.id, entry_date) or {
         "total_calories": 0,
@@ -330,6 +338,7 @@ def show_today_totals(message: Message) -> None:
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: Message) -> None:
     """Handle photo messages by estimating nutrition from image and caption."""
+    LOGGER.info("Handling photo message for user_id=%s", message.from_user.id)
     try:
         largest_photo = message.photo[-1]
         file_info = bot.get_file(largest_photo.file_id)
@@ -362,7 +371,9 @@ def handle_photo(message: Message) -> None:
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def handle_text(message: Message) -> None:
     """Handle plain text meal descriptions and ignore unknown slash commands."""
+    LOGGER.info("Handling text message for user_id=%s", message.from_user.id)
     if message.text.startswith("/"):
+        LOGGER.info("Ignoring unknown command text=%s", message.text)
         return
 
     try:
