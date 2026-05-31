@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import mimetypes
+import os
+import re
+import threading
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from flask import Flask, abort, request
+import requests
+import telebot
+from telebot.types import Message, Update
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger("nutrition_bot")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "UTC")
+BOT_MODE = os.getenv("BOT_MODE", "webhook" if os.getenv("RENDER") else "polling")
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+PORT = int(os.getenv("PORT", "10000"))
+
+REQUIRED_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_KEY": SUPABASE_KEY,
+}
+
+missing_env_vars = [name for name, value in REQUIRED_ENV_VARS.items() if not value]
+if missing_env_vars:
+    raise RuntimeError(
+        "Missing required environment variables: " + ", ".join(missing_env_vars)
+    )
+
+try:
+    LOCAL_TIMEZONE = ZoneInfo(APP_TIMEZONE)
+except ZoneInfoNotFoundError as exc:
+    raise RuntimeError(f"Invalid APP_TIMEZONE: {APP_TIMEZONE}") from exc
+
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+app = Flask(__name__)
+
+GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
+GEMINI_SYSTEM_PROMPT = (
+    "You are a nutrition estimation engine. Analyze the user's food text or image and "
+    "estimate the total calories and protein for the described meal. Return only valid "
+    'JSON matching this schema exactly: {"calories": int, "protein": int}. '
+    "Always use integers. Never include explanations, markdown, or extra keys. If the "
+    "meal is unclear, make the best reasonable estimate from the available information."
+)
+
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
+webhook_lock = threading.Lock()
+webhook_initialized = False
+
+
+def current_local_date() -> datetime.date:
+    return datetime.now(LOCAL_TIMEZONE).date()
+
+
+def calorie_limit_for(day: datetime.date) -> int:
+    return 2550 if day.weekday() == 5 else 1500
+
+
+def protein_goal() -> int:
+    return 100
+
+
+def extract_json_object(raw_text: str) -> dict[str, Any]:
+    stripped = raw_text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return json.loads(stripped)
+
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if not match:
+        raise ValueError(f"Gemini response did not include JSON: {raw_text}")
+
+    return json.loads(match.group(0))
+
+
+def call_gemini_for_food(
+    *,
+    food_text: str | None = None,
+    image_bytes: bytes | None = None,
+    image_mime_type: str | None = None,
+) -> dict[str, int]:
+    if not food_text and not image_bytes:
+        raise ValueError("Either food_text or image_bytes must be provided.")
+
+    prompt_text = (
+        "Estimate nutrition for this entry and return JSON only."
+        if not food_text
+        else f"Estimate nutrition for this entry and return JSON only: {food_text}"
+    )
+
+    user_parts: list[dict[str, Any]] = [{"text": prompt_text}]
+    if image_bytes:
+        mime_type = image_mime_type or "image/jpeg"
+        user_parts.append(
+            {
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": base64.b64encode(image_bytes).decode("utf-8"),
+                }
+            }
+        )
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": user_parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    response = requests.post(
+        f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    response_payload = response.json()
+    candidates = response_payload.get("candidates") or []
+    if not candidates:
+        raise ValueError(f"Gemini returned no candidates: {response_payload}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_fragments = [part.get("text", "") for part in parts if "text" in part]
+    if not text_fragments:
+        raise ValueError(f"Gemini returned no text response: {response_payload}")
+
+    parsed = extract_json_object("\n".join(text_fragments))
+    calories = max(0, int(parsed["calories"]))
+    protein = max(0, int(parsed["protein"]))
+    return {"calories": calories, "protein": protein}
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: Any | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
+    headers = dict(SUPABASE_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    response = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers=headers,
+        params=params,
+        json=json_body,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    if not response.content:
+        return None
+    return response.json()
+
+
+def get_daily_nutrition(user_id: int, entry_date: datetime.date) -> dict[str, Any] | None:
+    rows = supabase_request(
+        "GET",
+        "daily_nutrition",
+        params={
+            "select": "user_id,date,total_calories,total_protein",
+            "user_id": f"eq.{user_id}",
+            "date": f"eq.{entry_date.isoformat()}",
+            "limit": 1,
+        },
+    )
+    return rows[0] if rows else None
+
+
+def upsert_daily_nutrition(
+    user_id: int,
+    entry_date: datetime.date,
+    total_calories: int,
+    total_protein: int,
+) -> dict[str, Any]:
+    rows = supabase_request(
+        "POST",
+        "daily_nutrition",
+        params={"on_conflict": "user_id,date"},
+        json_body=[
+            {
+                "user_id": user_id,
+                "date": entry_date.isoformat(),
+                "total_calories": total_calories,
+                "total_protein": total_protein,
+            }
+        ],
+        extra_headers={
+            "Prefer": "resolution=merge-duplicates,return=representation"
+        },
+    )
+    return rows[0]
+
+
+def add_food_to_daily_totals(
+    user_id: int,
+    *,
+    calories: int,
+    protein: int,
+    entry_date: datetime.date,
+) -> dict[str, Any]:
+    existing = get_daily_nutrition(user_id, entry_date) or {
+        "total_calories": 0,
+        "total_protein": 0,
+    }
+    new_total_calories = int(existing["total_calories"]) + calories
+    new_total_protein = int(existing["total_protein"]) + protein
+    return upsert_daily_nutrition(
+        user_id=user_id,
+        entry_date=entry_date,
+        total_calories=new_total_calories,
+        total_protein=new_total_protein,
+    )
+
+
+def format_daily_summary(record: dict[str, Any], entry_date: datetime.date) -> str:
+    total_calories = int(record["total_calories"])
+    total_protein = int(record["total_protein"])
+    calorie_limit = calorie_limit_for(entry_date)
+    remaining_calories = calorie_limit - total_calories
+    remaining_protein = protein_goal() - total_protein
+    day_type = "Cheat day" if calorie_limit == 2550 else "Regular day"
+
+    return (
+        f"{day_type} totals for {entry_date.isoformat()}\n"
+        f"Calories: {total_calories}/{calorie_limit} ({remaining_calories:+d} remaining)\n"
+        f"Protein: {total_protein}/{protein_goal()}g ({remaining_protein:+d}g remaining)"
+    )
+
+
+def build_analysis_reply(
+    analysis: dict[str, int],
+    updated_record: dict[str, Any],
+    entry_date: datetime.date,
+) -> str:
+    return (
+        f"Added meal estimate:\n"
+        f"Calories: {analysis['calories']}\n"
+        f"Protein: {analysis['protein']}g\n\n"
+        f"{format_daily_summary(updated_record, entry_date)}"
+    )
+
+
+def handle_food_entry(message: Message, *, text: str | None, image_bytes: bytes | None) -> None:
+    entry_date = current_local_date()
+    mime_type = None
+    if image_bytes:
+        mime_type = "image/jpeg"
+
+    analysis = call_gemini_for_food(
+        food_text=text,
+        image_bytes=image_bytes,
+        image_mime_type=mime_type,
+    )
+    updated_record = add_food_to_daily_totals(
+        message.from_user.id,
+        calories=analysis["calories"],
+        protein=analysis["protein"],
+        entry_date=entry_date,
+    )
+    bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date))
+
+
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message: Message) -> None:
+    bot.reply_to(
+        message,
+        "Send a food description or a meal photo. I will estimate calories and protein, "
+        "save the totals for today, and track them against your daily goals.",
+    )
+
+
+@bot.message_handler(commands=["today"])
+def show_today_totals(message: Message) -> None:
+    entry_date = current_local_date()
+    record = get_daily_nutrition(message.from_user.id, entry_date) or {
+        "total_calories": 0,
+        "total_protein": 0,
+    }
+    bot.reply_to(message, format_daily_summary(record, entry_date))
+
+
+@bot.message_handler(content_types=["photo"])
+def handle_photo(message: Message) -> None:
+    try:
+        largest_photo = message.photo[-1]
+        file_info = bot.get_file(largest_photo.file_id)
+        downloaded_bytes = bot.download_file(file_info.file_path)
+        caption = message.caption.strip() if message.caption else None
+
+        guessed_mime_type, _ = mimetypes.guess_type(file_info.file_path)
+        image_mime_type = guessed_mime_type or "image/jpeg"
+        analysis = call_gemini_for_food(
+            food_text=caption,
+            image_bytes=downloaded_bytes,
+            image_mime_type=image_mime_type,
+        )
+        entry_date = current_local_date()
+        updated_record = add_food_to_daily_totals(
+            message.from_user.id,
+            calories=analysis["calories"],
+            protein=analysis["protein"],
+            entry_date=entry_date,
+        )
+        bot.reply_to(message, build_analysis_reply(analysis, updated_record, entry_date))
+    except Exception:
+        LOGGER.exception("Failed to process photo message")
+        bot.reply_to(
+            message,
+            "I could not analyze that photo right now. Please try again with a clearer image or add a caption.",
+        )
+
+
+@bot.message_handler(func=lambda message: True, content_types=["text"])
+def handle_text(message: Message) -> None:
+    if message.text.startswith("/"):
+        return
+
+    try:
+        handle_food_entry(message, text=message.text.strip(), image_bytes=None)
+    except Exception:
+        LOGGER.exception("Failed to process text message")
+        bot.reply_to(
+            message,
+            "I could not analyze that meal description right now. Please try again with a more specific description.",
+        )
+
+
+def webhook_url() -> str:
+    if not WEBHOOK_BASE_URL:
+        raise RuntimeError("WEBHOOK_BASE_URL is required when BOT_MODE=webhook.")
+    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
+
+def ensure_webhook() -> None:
+    global webhook_initialized
+
+    if BOT_MODE != "webhook" or webhook_initialized:
+        return
+
+    with webhook_lock:
+        if webhook_initialized:
+            return
+
+        target_webhook_url = webhook_url()
+        bot.remove_webhook()
+        if not bot.set_webhook(url=target_webhook_url, allowed_updates=["message"]):
+            raise RuntimeError("Failed to register Telegram webhook.")
+
+        webhook_initialized = True
+        LOGGER.info("Webhook registered at %s", target_webhook_url)
+
+
+@app.before_request
+def initialize_webhook_before_requests() -> None:
+    if BOT_MODE == "webhook":
+        ensure_webhook()
+
+
+@app.get("/healthz")
+def healthcheck() -> tuple[dict[str, str], int]:
+    return {"status": "ok", "mode": BOT_MODE}, 200
+
+
+@app.post(WEBHOOK_PATH)
+def telegram_webhook() -> tuple[str, int]:
+    if not request.is_json:
+        abort(403)
+
+    update = Update.de_json(request.get_data(as_text=True))
+    bot.process_new_updates([update])
+    return "ok", 200
+
+
+def main() -> None:
+    LOGGER.info("Starting nutrition bot in %s mode", BOT_MODE)
+
+    if BOT_MODE == "webhook":
+        ensure_webhook()
+        app.run(host="0.0.0.0", port=PORT)
+        return
+
+    bot.remove_webhook()
+    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+
+
+if BOT_MODE == "webhook":
+    ensure_webhook()
+
+
+if __name__ == "__main__":
+    main()

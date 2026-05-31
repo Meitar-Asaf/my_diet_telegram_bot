@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: my-diet-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 main:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_MODE
+        value: webhook
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: APP_TIMEZONE
+        value: UTC
