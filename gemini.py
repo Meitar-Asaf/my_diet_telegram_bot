@@ -16,7 +16,7 @@ LOGGER = logging.getLogger("nutrition_bot")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash:generateContent"
+    "gemini-2.0-flash:generateContent"
 )
 GEMINI_SYSTEM_PROMPT = (
     "You are a nutrition and intent engine for a Telegram diet bot. Analyze the user's "
