@@ -13,7 +13,7 @@ services:
         value: webhook
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
       - key: DB_HOST
         value: aws-1-ap-northeast-2.pooler.supabase.com

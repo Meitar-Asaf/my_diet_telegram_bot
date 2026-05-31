@@ -28,8 +28,8 @@ WEBHOOK_PATH = f"/{_TOKEN}"
 _missing: list[str] = []
 if not os.getenv("TELEGRAM_BOT_TOKEN"):
     _missing.append("TELEGRAM_BOT_TOKEN")
-if not os.getenv("GEMINI_API_KEY"):
-    _missing.append("GEMINI_API_KEY")
+if not os.getenv("GROQ_API_KEY"):
+    _missing.append("GROQ_API_KEY")
 if not os.getenv("DATABASE_URL"):
     for _var in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"):
         if not os.getenv(_var):
