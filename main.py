@@ -161,11 +161,7 @@ def is_small_talk_or_non_food(text: str) -> bool:
         return True
 
     lowered = normalized.lower()
-    if lowered in SMALL_TALK_HE or lowered in SMALL_TALK_EN:
-        return True
-
-    words = re.findall(r"[\w\u0590-\u05FF]+", lowered)
-    return len(words) <= 2 and not any(ch.isdigit() for ch in lowered)
+    return lowered in SMALL_TALK_HE or lowered in SMALL_TALK_EN
 
 
 def message_text(lang: str, key: str) -> str:
